@@ -1,0 +1,11 @@
+[package]
+name = "dominokit-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# zlib-rs: a pure-Rust port of zlib-ng, several times faster than miniz_oxide
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+rayon = "1.11"
+thiserror = "1"
+hex-literal = "1"

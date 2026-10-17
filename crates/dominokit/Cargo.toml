@@ -1,0 +1,16 @@
+[package]
+name = "dominokit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dominokit-core = { path = "../dominokit-core" }
+
+eframe = { workspace = true, features = ["glow", "default_fonts"] }
+thiserror = "1"
+serde = { workspace = true }
+serde_json = "1"
+directories = "5"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory"] }
+rfd = "0.12"
+rayon = "1.11"

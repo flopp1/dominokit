@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/dominokit-core", "crates/dominokit"]
+
+[workspace.dependencies]
+eframe = { version = "0.27", default-features = false }
+serde = { version = "1", features = ["derive"] }
