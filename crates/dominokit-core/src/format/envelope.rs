@@ -150,25 +150,47 @@ const BLOCK: usize = 1 << 20;
 const LEVEL: u32 = 1;
 
 pub fn encode(data: &[u8], magic: Magic) -> Vec<u8> {
-    let blocks: Vec<&[u8]> = if data.is_empty() { vec![data] } else { data.chunks(BLOCK).collect() };
-    let last = blocks.len() - 1;
-    let packed: Vec<(Vec<u8>, u32, usize)> = blocks
-        .par_iter()
-        .enumerate()
-        .map(|(i, block)| (deflate_block(block, i == last), adler32(block), block.len()))
-        .collect();
-
-    let checksum = packed.iter().skip(1).fold(packed[0].1, |acc, (_, a, len)| adler32_combine(acc, *a, *len));
-    let body: usize = packed.iter().map(|(b, _, _)| b.len()).sum();
-    let mut out = Vec::with_capacity(magic.header_len() + 2 + body + 4);
-    out.extend_from_slice(magic.as_bytes());
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&[0x78, 0x01]); // zlib header: deflate, 32K window, fastest
-    for (b, _, _) in &packed {
+    let mut out = Vec::with_capacity(magic.header_len() + data.len() / 3 + 64);
+    encode_streamed(data.len(), magic, |at, buf| buf.copy_from_slice(&data[at..at + buf.len()]), |b| {
         out.extend_from_slice(b);
-    }
-    out.extend_from_slice(&checksum.to_be_bytes());
+        Ok(())
+    })
+    .expect("writing to memory cannot fail");
     out
+}
+
+/// Encode a stream of `len` bytes that `fill(offset, buf)` produces on
+/// demand, passing the envelope to `sink` piece by piece. Blocks are
+/// produced and compressed a few dozen at a time on all cores, so memory
+/// stays at a few dozen megabytes whatever `len` is.
+pub fn encode_streamed(
+    len: usize,
+    magic: Magic,
+    fill: impl Fn(usize, &mut [u8]) + Sync,
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    sink(magic.as_bytes())?;
+    sink(&(len as u32).to_le_bytes())?;
+    sink(&[0x78, 0x01])?; // zlib header: deflate, 32K window, fastest
+    let blocks = len.div_ceil(BLOCK).max(1);
+    let window = rayon::current_num_threads() * 2;
+    let mut checksum = 1u32; // Adler-32 of nothing
+    for first in (0..blocks).step_by(window) {
+        let packed: Vec<(Vec<u8>, u32, usize)> = (first..(first + window).min(blocks))
+            .into_par_iter()
+            .map(|k| {
+                let size = BLOCK.min(len - k * BLOCK);
+                let mut buf = vec![0u8; size];
+                fill(k * BLOCK, &mut buf);
+                (deflate_block(&buf, k == blocks - 1), adler32(&buf), size)
+            })
+            .collect();
+        for (bytes, adler, size) in packed {
+            sink(&bytes)?;
+            checksum = adler32_combine(checksum, adler, size);
+        }
+    }
+    sink(&checksum.to_be_bytes())
 }
 
 /// Raw deflate of one block; non-final blocks end on a full flush so the

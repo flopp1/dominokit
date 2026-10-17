@@ -285,6 +285,44 @@ fn in_order_children(track: &Track, step: ChopStep, mut children: Vec<TrackChild
     children
 }
 
+/// Notes per chunk for the prefix sums of piece counts.
+const Q_CHUNK: usize = 4096;
+
+/// Child index of the j-th note. Notes are nearly always one contiguous run
+/// (settings before, tail chunks after), which needs no table at all.
+enum NoteIndex {
+    Run(usize, usize),
+    List(Vec<usize>),
+}
+
+impl NoteIndex {
+    fn new(track: &Track) -> NoteIndex {
+        let c = &track.children;
+        let first = c.iter().position(TrackChild::is_note);
+        let last = c.iter().rposition(TrackChild::is_note);
+        match (first, last) {
+            (Some(a), Some(b)) if c[a..=b].par_iter().all(TrackChild::is_note) => NoteIndex::Run(a, b + 1 - a),
+            (Some(_), _) => NoteIndex::List((0..c.len()).into_par_iter().filter(|&i| c[i].is_note()).collect()),
+            _ => NoteIndex::Run(0, 0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            NoteIndex::Run(_, n) => *n,
+            NoteIndex::List(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    fn child(&self, j: usize) -> usize {
+        match self {
+            NoteIndex::Run(first, _) => first + j,
+            NoteIndex::List(v) => v[j],
+        }
+    }
+}
+
 /// Parallel in-order chop of one track (notes in tick order).
 ///
 /// The output is split at grid lines `T_k`. Segment `k` emits, in order,
@@ -296,21 +334,45 @@ fn in_order_children(track: &Track, step: ChopStep, mut children: Vec<TrackChild
 /// Returns `None` (caller goes sequential) when the track is small, or when
 /// a note is so long that finding what sounds at a cut gets expensive.
 fn segmented(track: &Track, step: ChopStep, segment_notes: usize, mut children: Vec<TrackChild>) -> Result<Vec<TrackChild>, Vec<TrackChild>> {
-    let note_idx: Vec<usize> = (0..track.children.len()).into_par_iter().filter(|&i| track.children[i].is_note()).collect();
-    let n = note_idx.len();
+    let idx = NoteIndex::new(track);
+    let n = idx.len();
     let segments = (n / segment_notes.max(1)).min(rayon::current_num_threads() * 8);
     if segments < 2 {
         return Err(children);
     }
-    let note = |j: usize| *track.children[note_idx[j]].as_note().unwrap();
-    let counts: Vec<u64> = (0..n).into_par_iter().map(|j| pieces(&note(j), step)).collect();
-    let mut q = Vec::with_capacity(n + 1); // Q_j, plus the total at the end
+    let note = |j: usize| *track.children[idx.child(j)].as_note().unwrap();
+    // Q (the prefix sum of piece counts) is only kept per chunk of notes;
+    // inside a chunk it is recomputed on the fly, where it is needed
+    let chunk_sums: Vec<u64> = (0..n.div_ceil(Q_CHUNK))
+        .into_par_iter()
+        .map(|c| (c * Q_CHUNK..((c + 1) * Q_CHUNK).min(n)).map(|j| pieces(&note(j), step)).sum())
+        .collect();
+    let mut chunk_q = Vec::with_capacity(chunk_sums.len() + 1);
     let mut acc = 0u64;
-    for &c in &counts {
-        q.push(acc);
+    for &c in &chunk_sums {
+        chunk_q.push(acc);
         acc += c;
     }
-    q.push(acc);
+    chunk_q.push(acc);
+    // Q_j
+    let q = |j: usize| -> u64 {
+        let c = j / Q_CHUNK;
+        chunk_q[c] + (c * Q_CHUNK..j).map(|i| pieces(&note(i), step)).sum::<u64>()
+    };
+    // the note whose slots include slot r
+    let owner = |r: u64| -> usize {
+        let c = chunk_q.partition_point(|&x| x <= r) - 1;
+        let mut at = chunk_q[c];
+        let mut j = c * Q_CHUNK;
+        loop {
+            let p = pieces(&note(j), step);
+            if at + p > r {
+                return j;
+            }
+            at += p;
+            j += 1;
+        }
+    };
     let max_gate = (0..n).into_par_iter().map(|j| note(j).gate as u64).max().unwrap_or(0);
 
     // cut lines (grid line indices), strictly increasing
@@ -351,25 +413,31 @@ fn segmented(track: &Track, step: ChopStep, segment_notes: usize, mut children: 
                 }
                 let end = m.tick as u64 + m.gate as u64;
                 if end > t {
-                    active.push(Active { key: m.key, seq: note_idx[j], end, note: m, src: note_idx[j] });
+                    active.push(Active { key: m.key, seq: idx.child(j), end, note: m, src: idx.child(j) });
                     lost += step.first_line_from(end) - li;
                 }
             }
             active.sort_by_key(|a| (a.key, a.seq));
-            Some(Seg { line_index: li, first_input, active, rank: q[first_input] - lost })
+            Some(Seg { line_index: li, first_input, active, rank: q(first_input) - lost })
         })
         .collect();
     let Some(starts) = starts.into_iter().collect::<Option<Vec<Seg>>>() else { return Err(children) };
 
-    let total = q[n];
+    let total = acc;
     // where each segment's output begins: note slot r sits at output index
     // r + (non-note children before the note owning slot r)
-    let owner = |r: u64| q.partition_point(|&x| x <= r) - 1;
     let len = track.children.len() - n + total as usize;
     let mut bounds: Vec<usize> = starts
         .iter()
         .enumerate()
-        .map(|(k, seg)| if k == 0 { 0 } else { note_idx[owner(seg.rank)] - owner(seg.rank) + seg.rank as usize })
+        .map(|(k, seg)| {
+            if k == 0 {
+                0
+            } else {
+                let j = owner(seg.rank);
+                idx.child(j) - j + seg.rank as usize
+            }
+        })
         .collect();
     bounds.push(len);
     if bounds.windows(2).any(|w| w[0] > w[1]) {
@@ -390,11 +458,12 @@ fn segmented(track: &Track, step: ChopStep, segment_notes: usize, mut children: 
         let seg = &starts[k];
         let (r0, r1) = (seg.rank, starts.get(k + 1).map_or(total, |s| s.rank));
         let stop = starts.get(k + 1).map_or(u64::MAX, |s| step.line(s.line_index));
-        let mut sorted = InOrder::new(track, step, seg.first_input, seg.active.clone(), seg.line_index);
+        let first_child = if seg.first_input < n { idx.child(seg.first_input) } else { track.children.len() };
+        let mut sorted = InOrder::new(track, step, first_child, seg.active.clone(), seg.line_index);
         // note slot r0 is `skip` slots into note j's block
         let mut j = if k == 0 { 0 } else { owner(r0) };
-        let mut skip = r0 - q[j];
-        let mut child = if k == 0 { 0 } else { note_idx[j] };
+        let mut skip = r0 - q(j);
+        let mut child = if k == 0 { 0 } else { idx.child(j) };
         let mut w = 0usize;
         let mut put = |c: TrackChild| match region.get_mut(w) {
             Some(slot) => {
@@ -411,7 +480,7 @@ fn segmented(track: &Track, step: ChopStep, segment_notes: usize, mut children: 
                 if r == r1 && k + 1 < starts.len() {
                     break;
                 }
-                let block = q[j + 1] - q[j];
+                let block = pieces(&note(j), step);
                 while skip < block && r < r1 {
                     let Some((piece, src)) = sorted.next() else { return false };
                     if piece.tick as u64 >= stop || !put(track.children[src].with_note(piece)) {
@@ -549,18 +618,34 @@ enum Phase {
     Done,
 }
 
-type NoteIter<'a> = std::iter::FilterMap<std::iter::Enumerate<std::slice::Iter<'a, TrackChild>>, fn((usize, &TrackChild)) -> Option<(usize, NoteItem)>>;
+/// The notes of a track from a child index on, as (child index, note).
+struct NotesFrom<'a> {
+    children: &'a [TrackChild],
+    i: usize,
+}
 
-impl<'a> InOrder<'a, std::iter::Skip<NoteIter<'a>>> {
-    /// Start at note number `first_input`, with `active` sounding across grid
-    /// line `line_index` (empty and 0 to start at the beginning).
-    fn new(track: &'a Track, step: ChopStep, first_input: usize, active: Vec<Active>, line_index: u64) -> Self {
-        fn note_of((i, c): (usize, &TrackChild)) -> Option<(usize, NoteItem)> {
-            c.as_note().map(|n| (i, *n))
+impl Iterator for NotesFrom<'_> {
+    type Item = (usize, NoteItem);
+
+    #[inline]
+    fn next(&mut self) -> Option<(usize, NoteItem)> {
+        while self.i < self.children.len() {
+            let i = self.i;
+            self.i += 1;
+            if let Some(n) = self.children[i].as_note() {
+                return Some((i, *n));
+            }
         }
-        let notes: NoteIter<'a> = track.children.iter().enumerate().filter_map(note_of as fn((usize, &TrackChild)) -> Option<(usize, NoteItem)>);
+        None
+    }
+}
+
+impl<'a> InOrder<'a, NotesFrom<'a>> {
+    /// Start at child `first_child`, with `active` sounding across grid
+    /// line `line_index` (empty and 0 to start at the beginning).
+    fn new(track: &'a Track, step: ChopStep, first_child: usize, active: Vec<Active>, line_index: u64) -> Self {
         InOrder {
-            input: ByTickKey::new(notes.skip(first_input)),
+            input: ByTickKey::new(NotesFrom { children: &track.children, i: first_child }),
             step,
             active,
             next_active: Vec::new(),
@@ -850,7 +935,7 @@ mod tests {
                 tick += next(3) * next(40);
                 let gate = if next(50) == 0 { next(5000) } else { next(400) };
                 track.children.push(TrackChild::Note(NoteItem::canonical(tick, gate, next(5) as u8 * 7, 1 + next(126) as u8)));
-                if next(15) == 0 {
+                if round % 2 == 0 && next(15) == 0 {
                     track.children.push(TrackChild::event(events::control(tick, 7, 1.0)));
                 }
             }

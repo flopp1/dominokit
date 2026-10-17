@@ -318,10 +318,20 @@ pub struct EventItem {
 
 impl EventItem {
     fn write(&self, out: &mut Out<'_>) {
-        let start = out.pos;
-        out.item(self.id, &self.item.body);
-        if let Some(p) = self.pos {
-            patch_pos_in_body(&mut out.buf[start + 6..out.pos], p);
+        match self.pos {
+            Some(p) if out.holds(6 + self.item.body.len()) => {
+                let start = out.pos - out.base;
+                out.item(self.id, &self.item.body);
+                let end = out.pos - out.base;
+                patch_pos_in_body(&mut out.buf[start + 6..end], p);
+            }
+            Some(p) => {
+                // crosses the window's edge: patch a copy
+                let mut body = self.item.body.clone();
+                patch_pos_in_body(&mut body, p);
+                out.item(self.id, &body);
+            }
+            None => out.item(self.id, &self.item.body),
         }
     }
 
@@ -773,20 +783,49 @@ fn parse_length(body: &[u8]) -> TrackChild {
 
 // ---- encoding -----------------------------------------------------------------
 
-/// Cursor over a pre-sized output region.
+/// Cursor over an output region. `pos` counts bytes of the whole stream;
+/// `buf` holds bytes `base .. base + buf.len()` of it, so a writer can be
+/// pointed at any window of the stream and only that window is stored.
 struct Out<'a> {
     buf: &'a mut [u8],
     pos: usize,
+    base: usize,
 }
 
 impl<'a> Out<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
-        Out { buf, pos: 0 }
+        Out { buf, pos: 0, base: 0 }
+    }
+
+    fn window(buf: &'a mut [u8], pos: usize, base: usize) -> Self {
+        Out { buf, pos, base }
+    }
+
+    /// Past the end of the window: nothing more lands in it.
+    #[inline]
+    fn done(&self) -> bool {
+        self.pos >= self.base + self.buf.len()
+    }
+
+    /// Whether `[pos, pos + len)` lies wholly inside the window.
+    #[inline]
+    fn holds(&self, len: usize) -> bool {
+        self.pos >= self.base && self.pos + len <= self.base + self.buf.len()
     }
 
     #[inline]
     fn put(&mut self, b: &[u8]) {
-        self.buf[self.pos..self.pos + b.len()].copy_from_slice(b);
+        if self.holds(b.len()) {
+            let at = self.pos - self.base;
+            self.buf[at..at + b.len()].copy_from_slice(b);
+        } else {
+            // the part of `b` that overlaps the window, if any
+            let from = self.pos.max(self.base);
+            let to = (self.pos + b.len()).min(self.base + self.buf.len());
+            if from < to {
+                self.buf[from - self.base..to - self.base].copy_from_slice(&b[from - self.pos..to - self.pos]);
+            }
+        }
         self.pos += b.len();
     }
 
@@ -808,6 +847,146 @@ pub struct EncodeOptions {
     pub uniform_length: Option<u32>,
     /// Insert this track before the first track.
     pub insert_before_first_track: Option<Track>,
+}
+
+/// The encoded stream of a clip, laid out so that any byte range of it can
+/// be produced on its own ([`StreamPlan::fill`]). This lets the compressor
+/// pull the stream in small blocks, on all cores, without the whole
+/// unpacked stream (40 bytes per note) ever existing in memory.
+pub struct StreamPlan<'c> {
+    clip: &'c Clip,
+    inserted: Option<Track>,
+    length_override: Option<u32>,
+    starts: Vec<usize>,
+    parts: Vec<Part>,
+    total: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Src {
+    Node(usize),
+    Inserted,
+}
+
+#[derive(Clone, Copy)]
+enum Part {
+    Raw(usize),
+    TrackHeader(usize),
+    Children(Src, usize, usize),
+    TrackTrailing(Src),
+    RootTrailing,
+}
+
+impl<'c> StreamPlan<'c> {
+    pub fn new(clip: &'c Clip, opts: &EncodeOptions) -> StreamPlan<'c> {
+        let mut plan = StreamPlan {
+            clip,
+            inserted: opts.insert_before_first_track.clone(),
+            length_override: opts.uniform_length,
+            starts: Vec::new(),
+            parts: Vec::new(),
+            total: 0,
+        };
+        let mut order: Vec<Src> = Vec::with_capacity(clip.nodes.len() + 1);
+        let mut pending = plan.inserted.is_some();
+        for (i, node) in clip.nodes.iter().enumerate() {
+            if let TopNode::Track(t) = node {
+                if std::mem::take(&mut pending) {
+                    order.push(Src::Inserted);
+                }
+                if opts.skip_conductor && t.is_conductor() {
+                    continue;
+                }
+            }
+            order.push(Src::Node(i));
+        }
+        if pending {
+            order.push(Src::Inserted);
+        }
+        // children blocks of each track, sized in parallel
+        for src in order {
+            if let Src::Node(i) = src {
+                if let TopNode::Raw(item) = &clip.nodes[i] {
+                    plan.push(Part::Raw(i), 6 + item.body.len());
+                    continue;
+                }
+            }
+            let track = plan.track(src);
+            let blocks: Vec<(usize, usize)> = (0..track.children.len()).step_by(PAR_CHILDREN).map(|a| (a, (a + PAR_CHILDREN).min(track.children.len()))).collect();
+            let lens: Vec<usize> = blocks.par_iter().map(|&(a, b)| track.children[a..b].iter().map(TrackChild::encoded_len).sum()).collect();
+            let trailing = track.trailing.len();
+            plan.push(Part::TrackHeader(lens.iter().sum::<usize>() + trailing), 6);
+            for (&(a, b), len) in blocks.iter().zip(lens) {
+                plan.push(Part::Children(src, a, b), len);
+            }
+            plan.push(Part::TrackTrailing(src), trailing);
+        }
+        plan.push(Part::RootTrailing, clip.trailing.len());
+        plan
+    }
+
+    fn push(&mut self, part: Part, len: usize) {
+        self.starts.push(self.total);
+        self.parts.push(part);
+        self.total += len;
+    }
+
+    fn track(&self, src: Src) -> &Track {
+        match src {
+            Src::Node(i) => self.clip.nodes[i].as_track().unwrap(),
+            Src::Inserted => self.inserted.as_ref().unwrap(),
+        }
+    }
+
+    /// Length of the whole encoded stream.
+    pub fn len(&self) -> usize {
+        self.total
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Write bytes `offset .. offset + buf.len()` of the stream into `buf`.
+    pub fn fill(&self, offset: usize, buf: &mut [u8]) {
+        if buf.is_empty() {
+            return;
+        }
+        let mut k = self.starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        let mut out = Out::window(buf, self.starts[k], offset);
+        while k < self.parts.len() && !out.done() {
+            match self.parts[k] {
+                Part::Raw(i) => {
+                    if let TopNode::Raw(item) = &self.clip.nodes[i] {
+                        out.item(item.tag, &item.body);
+                    }
+                }
+                Part::TrackHeader(body_len) => {
+                    out.put(&1003u16.to_le_bytes());
+                    out.put(&(body_len as u32).to_le_bytes());
+                }
+                Part::Children(src, a, b) => {
+                    for child in &self.track(src).children[a..b] {
+                        let len = child.encoded_len();
+                        if out.pos + len <= out.base {
+                            out.pos += len; // before the window: skip without encoding
+                            continue;
+                        }
+                        if out.done() {
+                            break;
+                        }
+                        match (child, self.length_override) {
+                            (TrackChild::Length(l), Some(v)) => LengthItem { length: v, ..(**l).clone() }.write(&mut out),
+                            _ => child.write(&mut out),
+                        }
+                    }
+                }
+                Part::TrackTrailing(src) => out.put(&self.track(src).trailing),
+                Part::RootTrailing => out.put(&self.clip.trailing),
+            }
+            k += 1;
+        }
+    }
 }
 
 /// The file format stores every chunk size, and the whole unpacked size, in
@@ -1059,6 +1238,48 @@ mod tests {
         assert_eq!(clip.note_count(), 400_000);
         assert_eq!(encode_clip(&clip), unpacked);
         assert_eq!(count_notes(&unpacked), 400_000);
+    }
+
+    #[test]
+    fn stream_plan_windows_equal_the_full_encoding() {
+        let mut body = Vec::new();
+        for i in 0..40_000u32 {
+            body.extend_from_slice(&crate::format::template::note_bytes(i, (i % 128) as u8, 100, 10));
+            if i % 7_000 == 3 {
+                body.extend_from_slice(&item(2003, &{
+                    let mut e = item(1001, &i.to_le_bytes());
+                    e.extend_from_slice(&item(2001, &[7, 0]));
+                    e
+                }));
+            }
+        }
+        body.extend_from_slice(&chunk::Item { tag: 2009, body: item(1001, &99u32.to_le_bytes()) }.encode());
+        let mut unpacked = item(1002, &[0xE0, 0x01]);
+        unpacked.extend_from_slice(&chunk::Item { tag: 1003, body: body.clone() }.encode());
+        unpacked.extend_from_slice(&chunk::Item { tag: 1003, body }.encode());
+        unpacked.extend_from_slice(&[1, 2, 3]);
+        let clip = decode_clip(&unpacked);
+        for opts in [
+            EncodeOptions::default(),
+            EncodeOptions { uniform_length: Some(12345), ..Default::default() },
+            EncodeOptions { insert_before_first_track: Some(clip.tracks().next().unwrap().clone()), ..Default::default() },
+        ] {
+            let full = encode_clip_with(&clip, &opts);
+            let plan = StreamPlan::new(&clip, &opts);
+            assert_eq!(plan.len(), full.len());
+            // windows of awkward sizes, so events and notes straddle edges
+            for size in [997usize, 4093, 65_521, 1 << 20] {
+                let mut joined = Vec::with_capacity(full.len());
+                let mut at = 0;
+                while at < full.len() {
+                    let mut buf = vec![0u8; size.min(full.len() - at)];
+                    plan.fill(at, &mut buf);
+                    joined.extend_from_slice(&buf);
+                    at += buf.len();
+                }
+                assert!(joined == full, "window size {size}");
+            }
+        }
     }
 
     #[test]

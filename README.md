@@ -114,6 +114,17 @@ without intermediate event lists. Nothing copies the working copy: writes
 encode straight from it, Flip is undone by flipping again, and Chop's undo
 keeps the clip it replaced within a 512 MB budget.
 
+**Memory.** A note costs 16 bytes in memory and almost nothing else:
+chop writes its result straight into place (no per-note temporaries),
+`.mid` export streams each big track to the file and keeps only the notes
+currently sounding, `.dms` / clipboard export encodes and compresses the
+stream 1 MB block at a time (only the compressed payload is ever held, and
+for files not even that), and the overview's index is a sparse sample (a few
+bytes per thousand notes). Chopping 30 M notes to 1 tick (300 M notes) and
+exporting a 2.3 GB `.mid` peaks at 5.5 GB, the clip itself being 5.3 GB
+(`cargo run --release --example membench -- 30000000 16`). Undo keeps the
+clip a chop replaced (always the latest one, older ones within 512 MB).
+
 The overview rasterises notes into one texture, in parallel stripes, only
 when the view or the clip changes. Overlapping notes are removed while
 rasterising — per track and key, a note hidden behind what is already drawn

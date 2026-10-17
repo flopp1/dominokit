@@ -8,7 +8,9 @@
 //! Both directions stream: events are read straight out of the file bytes
 //! and written straight into the output, one track per thread.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
+use std::io::{self, Seek, SeekFrom, Write};
 
 use rayon::prelude::*;
 
@@ -252,15 +254,49 @@ fn import_track<'a>(
 // export
 // ---------------------------------------------------------------------------
 
-/// Delta-time event writer for one `MTrk` body.
-struct TrackWriter {
+/// Delta-time event writer for one `MTrk` body. With a sink, the bytes
+/// are passed on every megabyte instead of piling up in memory.
+struct TrackWriter<'a> {
     out: Vec<u8>,
+    sink: Option<&'a mut dyn Write>,
+    /// Bytes already handed to the sink.
+    flushed: u64,
+    error: Option<io::Error>,
     last: u32,
 }
 
-impl TrackWriter {
+const FLUSH_AT: usize = 1 << 20;
+
+impl<'a> TrackWriter<'a> {
     fn new(capacity: usize) -> Self {
-        TrackWriter { out: Vec::with_capacity(capacity), last: 0 }
+        TrackWriter { out: Vec::with_capacity(capacity), sink: None, flushed: 0, error: None, last: 0 }
+    }
+
+    fn streaming(sink: &'a mut dyn Write) -> Self {
+        TrackWriter { out: Vec::with_capacity(FLUSH_AT + 64), sink: Some(sink), flushed: 0, error: None, last: 0 }
+    }
+
+    #[inline]
+    fn spill(&mut self) {
+        if self.out.len() >= FLUSH_AT {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(sink) = self.sink.as_mut() {
+            if self.error.is_none() {
+                if let Err(e) = sink.write_all(&self.out) {
+                    self.error = Some(e);
+                }
+            }
+            self.flushed += self.out.len() as u64;
+            self.out.clear();
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.flushed + self.out.len() as u64
     }
 
     #[inline]
@@ -274,6 +310,7 @@ impl TrackWriter {
     fn channel(&mut self, tick: u32, bytes: &[u8]) {
         self.at(tick);
         self.out.extend_from_slice(bytes);
+        self.spill();
     }
 
     fn meta(&mut self, tick: u32, kind: u8, data: &[u8]) {
@@ -281,13 +318,24 @@ impl TrackWriter {
         self.out.extend_from_slice(&[0xFF, kind]);
         write_varlen(&mut self.out, data.len() as u32);
         self.out.extend_from_slice(data);
+        self.spill();
     }
 }
 
-/// Convert a clip to format-1 SMF bytes. A clip without a conductor track
+/// Bytes kept in memory at once when tracks are encoded in parallel; a
+/// track estimated bigger than this is streamed to the output on its own.
+const BATCH_BYTES: u64 = 256 << 20;
+
+/// Write a clip as a format-1 SMF to `w`. A clip without a conductor track
 /// (e.g. a clipboard copy) gets an empty one in front, so every clip track
 /// keeps its own SMF track when the file is opened in Domino again.
-pub fn smf_bytes_from_clip(clip: &Clip) -> Result<(Vec<u8>, Vec<String>), String> {
+///
+/// Memory stays small whatever the clip size: small tracks are encoded in
+/// parallel in batches of at most `BATCH_BYTES`, big tracks are streamed
+/// straight into `w` (their length is patched in afterwards), and note-offs
+/// wait in a heap that only holds the notes sounding at the moment.
+pub fn write_smf<W: Write + Seek>(clip: &Clip, w: &mut W) -> Result<Vec<String>, String> {
+    let io = |e: io::Error| format!("could not write the MIDI file: {e}");
     let root = |tag: u16| -> Vec<u8> {
         clip.nodes
             .iter()
@@ -298,39 +346,92 @@ pub fn smf_bytes_from_clip(clip: &Clip) -> Result<(Vec<u8>, Vec<String>), String
             .unwrap_or_default()
     };
     let (song_name, copyright) = (root(1000), root(1001));
-
     let tracks: Vec<&Track> = clip.tracks().collect();
-    let mut bodies: Vec<(Vec<u8>, Warnings)> =
-        tracks.par_iter().map(|t| export_track(t, &song_name, &copyright)).collect();
-    if !tracks.iter().any(|t| t.is_conductor()) {
-        let mut w = TrackWriter::new(64);
-        conductor_head(&mut w, &song_name, &copyright);
-        w.meta(0, 0x2F, &[]);
-        bodies.insert(0, (w.out, Warnings::default()));
+    let add_conductor = !tracks.iter().any(|t| t.is_conductor());
+    let count = tracks.len() + add_conductor as usize;
+    // the SMF header counts tracks in 16 bits and each track's size in 32
+    if count > u16::MAX as usize {
+        return Err(format!("{count} tracks, but a MIDI file holds at most 65535"));
     }
 
-    // the SMF header counts tracks in 16 bits and each track's size in 32
-    if bodies.len() > u16::MAX as usize {
-        return Err(format!("{} tracks, but a MIDI file holds at most 65535", bodies.len()));
+    w.write_all(b"MThd").map_err(io)?;
+    w.write_all(&6u32.to_be_bytes()).map_err(io)?;
+    w.write_all(&1u16.to_be_bytes()).map_err(io)?;
+    w.write_all(&(count as u16).to_be_bytes()).map_err(io)?;
+    w.write_all(&clip.ppq().unwrap_or(480).to_be_bytes()).map_err(io)?;
+    let chunk = |w: &mut W, body: &[u8], k: usize| -> Result<(), String> {
+        if body.len() > u32::MAX as usize {
+            return Err(format!("MIDI track {} would be over 4096 MB, the most a MIDI file can store", k + 1));
+        }
+        w.write_all(b"MTrk").map_err(io)?;
+        w.write_all(&(body.len() as u32).to_be_bytes()).map_err(io)?;
+        w.write_all(body).map_err(io)
+    };
+    if add_conductor {
+        let mut c = TrackWriter::new(64);
+        conductor_head(&mut c, &song_name, &copyright);
+        c.meta(0, 0x2F, &[]);
+        chunk(w, &c.out, 0)?;
     }
-    if let Some(k) = bodies.iter().position(|(b, _)| b.len() > u32::MAX as usize) {
-        return Err(format!("MIDI track {} would be over 4096 MB, the most a MIDI file can store", k + 1));
-    }
-    let total: usize = 14 + bodies.iter().map(|(b, _)| 8 + b.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(b"MThd");
-    out.extend_from_slice(&6u32.to_be_bytes());
-    out.extend_from_slice(&1u16.to_be_bytes());
-    out.extend_from_slice(&(bodies.len() as u16).to_be_bytes());
-    out.extend_from_slice(&clip.ppq().unwrap_or(480).to_be_bytes());
+    let first = add_conductor as usize;
+
+    let estimate = |t: &Track| t.children.len() as u64 * 9 + 64;
     let mut warnings = Warnings::default();
-    for (body, w) in bodies {
-        out.extend_from_slice(b"MTrk");
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(&body);
-        warnings = warnings.merge(w);
+    let mut k = 0usize;
+    while k < tracks.len() {
+        if estimate(tracks[k]) > BATCH_BYTES {
+            // stream this one: header, body, then patch the length in
+            let at = w.stream_position().map_err(io)?;
+            w.write_all(b"MTrk\0\0\0\0").map_err(io)?;
+            let mut tw = TrackWriter::streaming(w);
+            export_track(tracks[k], &song_name, &copyright, &mut tw, &mut warnings);
+            tw.flush();
+            let (len, error) = (tw.len(), tw.error.take());
+            drop(tw);
+            if let Some(e) = error {
+                return Err(io(e));
+            }
+            if len > u32::MAX as u64 {
+                return Err(format!("MIDI track {} would be over 4096 MB, the most a MIDI file can store", first + k + 1));
+            }
+            let end = w.stream_position().map_err(io)?;
+            w.seek(SeekFrom::Start(at + 4)).map_err(io)?;
+            w.write_all(&(len as u32).to_be_bytes()).map_err(io)?;
+            w.seek(SeekFrom::Start(end)).map_err(io)?;
+            k += 1;
+            continue;
+        }
+        // a batch of small tracks, encoded in parallel
+        let mut end = k;
+        let mut bytes = 0u64;
+        while end < tracks.len() && estimate(tracks[end]) <= BATCH_BYTES && bytes + estimate(tracks[end]) <= BATCH_BYTES {
+            bytes += estimate(tracks[end]);
+            end += 1;
+        }
+        let end = end.max(k + 1);
+        let bodies: Vec<(Vec<u8>, Warnings)> = tracks[k..end]
+            .par_iter()
+            .map(|t| {
+                let mut tw = TrackWriter::new(estimate(t) as usize);
+                let mut warn = Warnings::default();
+                export_track(t, &song_name, &copyright, &mut tw, &mut warn);
+                (tw.out, warn)
+            })
+            .collect();
+        for (i, (body, warn)) in bodies.into_iter().enumerate() {
+            chunk(w, &body, first + k + i)?;
+            warnings = warnings.merge(warn);
+        }
+        k = end;
     }
-    Ok((out, warnings.finish()))
+    Ok(warnings.finish())
+}
+
+/// Convert a clip to format-1 SMF bytes in memory (see [`write_smf`]).
+pub fn smf_bytes_from_clip(clip: &Clip) -> Result<(Vec<u8>, Vec<String>), String> {
+    let mut cursor = io::Cursor::new(Vec::new());
+    let warnings = write_smf(clip, &mut cursor)?;
+    Ok((cursor.into_inner(), warnings))
 }
 
 /// Convert a clip to a parsed SMF (tests and small tools).
@@ -350,82 +451,115 @@ fn clamp7(v: f32) -> u8 {
     (v as i32).clamp(0, 127) as u8
 }
 
-/// Something that sounds at a tick: a note-on or an event. `class` orders
-/// same-tick items the way Domino does: everything in its original order,
-/// then time signatures, then key signatures.
-#[derive(Clone, Copy)]
-struct On {
-    tick: u32,
-    class: u8,
-    idx: usize,
+/// Same-tick order class, the way Domino writes: everything in its original
+/// order, then time signatures, then key signatures.
+fn class_of(id: u16) -> u8 {
+    match id {
+        2015 => 2,
+        2016 => 3,
+        _ => 1,
+    }
 }
 
-fn export_track(track: &Track, song_name: &[u8], copyright: &[u8]) -> (Vec<u8>, Warnings) {
-    let ch = track.channel().unwrap_or(0) & 0x0F;
-    let mut warn = Warnings::default();
-    let mut ons: Vec<On> = Vec::with_capacity(track.children.len());
-    let mut offs: Vec<(u32, u8)> = Vec::with_capacity(track.children.len());
-    for (idx, child) in track.children.iter().enumerate() {
-        match child {
-            TrackChild::Note(_) | TrackChild::OddNote(_) => {
-                let n = child.as_note().unwrap();
-                ons.push(On { tick: n.tick, class: 1, idx });
-                offs.push(((n.tick as u64 + n.gate as u64).min(u32::MAX as u64) as u32, n.key.min(127)));
-            }
-            TrackChild::Event(e) => {
-                if let Some(pos) = e.pos {
-                    let class = match e.id {
-                        2015 => 2,
-                        2016 => 3,
-                        _ => 1,
-                    };
-                    ons.push(On { tick: pos, class, idx });
-                }
-            }
-            _ => {}
-        }
+/// When a child sounds, if it does: (tick, class).
+fn sounding(child: &TrackChild) -> Option<(u32, u8)> {
+    match child.as_note() {
+        Some(n) => Some((n.tick, 1)),
+        None => child.as_event().and_then(|e| e.pos.map(|p| (p, class_of(e.id)))),
     }
-    // already in order for anything Domino wrote; sort (stably) otherwise
-    if !ons.windows(2).all(|p| (p[0].tick, p[0].class) <= (p[1].tick, p[1].class)) {
-        ons.par_sort_by_key(|o| (o.tick, o.class));
-    }
-    if !offs.windows(2).all(|p| p[0].0 <= p[1].0) {
-        offs.par_sort_by_key(|o| o.0);
-    }
+}
 
-    let mut w = TrackWriter::new(offs.len() * 8 + ons.len() * 8 + 64);
+/// A note-off waiting to be written: ordered by tick, then by note order.
+type PendingOff = Reverse<(u32, u64, u8)>;
+
+fn export_track(track: &Track, song_name: &[u8], copyright: &[u8], w: &mut TrackWriter, warn: &mut Warnings) {
+    let ch = track.channel().unwrap_or(0) & 0x0F;
     if track.is_conductor() {
-        conductor_head(&mut w, song_name, copyright);
+        conductor_head(w, song_name, copyright);
     } else {
         let name = track.setting(1002).map(|i| i.body.as_slice()).unwrap_or(&[]);
         w.meta(0, 0x03, name);
         w.meta(0, 0x21, &[track.port().unwrap_or(0) as u8]);
     }
-
-    // merge: at the same tick note-offs go first (a re-struck key isn't cut short)
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < ons.len() || j < offs.len() {
-        if j < offs.len() && (i == ons.len() || offs[j].0 <= ons[i].tick) {
-            let (tick, key) = offs[j];
-            w.channel(tick, &[0x80 | ch, key, 0]);
-            j += 1;
-            continue;
-        }
-        let on = ons[i];
-        i += 1;
-        let child = &track.children[on.idx];
+    let in_order = {
+        let mut last = 0u32;
+        track.children.iter().filter_map(sounding).all(|(t, _)| {
+            let ok = t >= last;
+            last = t;
+            ok
+        })
+    };
+    let mut emit = |w: &mut TrackWriter, idx: usize, tick: u32| {
+        let child = &track.children[idx];
         match (child.as_note(), child.as_event()) {
-            (Some(n), _) => w.channel(on.tick, &[0x90 | ch, n.key.min(127), n.vel.clamp(1, 127)]),
-            (_, Some(e)) => write_event(&mut w, on.tick, ch, &events::decode(e), &mut warn),
+            (Some(n), _) => w.channel(tick, &[0x90 | ch, n.key.min(127), n.vel.clamp(1, 127)]),
+            (_, Some(e)) => write_event(w, tick, ch, &events::decode(e), warn),
             _ => unreachable!(),
+        }
+    };
+
+    if in_order {
+        // stream: same-tick groups (sorted by class), with note-offs from a
+        // heap; at the same tick note-offs go first (a re-struck key isn't
+        // cut short)
+        let mut offs: BinaryHeap<PendingOff> = BinaryHeap::new();
+        let mut seq = 0u64;
+        let mut group: Vec<(u8, usize)> = Vec::new();
+        let mut items = track.children.iter().enumerate().filter_map(|(i, c)| sounding(c).map(|(t, cl)| (t, cl, i))).peekable();
+        while let Some((tick, class, idx)) = items.next() {
+            group.clear();
+            group.push((class, idx));
+            while let Some(&(t, cl, i)) = items.peek() {
+                if t != tick {
+                    break;
+                }
+                group.push((cl, i));
+                items.next();
+            }
+            if !group.windows(2).all(|g| g[0].0 <= g[1].0) {
+                group.sort_by_key(|g| g.0);
+            }
+            while let Some(&Reverse((off, _, key))) = offs.peek() {
+                if off > tick {
+                    break;
+                }
+                w.channel(off, &[0x80 | ch, key, 0]);
+                offs.pop();
+            }
+            for &(_, idx) in &group {
+                emit(w, idx, tick);
+                if let Some(n) = track.children[idx].as_note() {
+                    offs.push(Reverse((n.end_u32(), seq, n.key.min(127))));
+                    seq += 1;
+                }
+            }
+        }
+        while let Some(Reverse((off, _, key))) = offs.pop() {
+            w.channel(off, &[0x80 | ch, key, 0]);
+        }
+    } else {
+        // rare: children out of time order; sort an index instead
+        let mut ons: Vec<(u32, u8, usize)> =
+            track.children.iter().enumerate().filter_map(|(i, c)| sounding(c).map(|(t, cl)| (t, cl, i))).collect();
+        ons.par_sort_by_key(|o| (o.0, o.1));
+        let mut offs: Vec<(u32, u8)> = track.notes().map(|n| (n.end_u32(), n.key.min(127))).collect();
+        offs.par_sort_by_key(|o| o.0);
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < ons.len() || j < offs.len() {
+            if j < offs.len() && (i == ons.len() || offs[j].0 <= ons[i].0) {
+                w.channel(offs[j].0, &[0x80 | ch, offs[j].1, 0]);
+                j += 1;
+            } else {
+                emit(w, ons[i].2, ons[i].0);
+                i += 1;
+            }
         }
     }
     let eot = track.length().unwrap_or(0).max(w.last);
     w.meta(eot, 0x2F, &[]);
-    (w.out, warn)
 }
 
-fn write_event(w: &mut TrackWriter, t: u32, ch: u8, value: &EventValue, warn: &mut Warnings) {
+fn write_event(w: &mut TrackWriter<'_>, t: u32, ch: u8, value: &EventValue, warn: &mut Warnings) {
     let cc = |w: &mut TrackWriter, n: u8, v: u8| w.channel(t, &[0xB0 | ch, n, v]);
     match *value {
         EventValue::Program { patch } => w.channel(t, &[0xC0 | ch, patch.saturating_sub(1) & 0x7F]),

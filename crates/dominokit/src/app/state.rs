@@ -526,9 +526,7 @@ fn write_file(clip: &Clip, path: &Path, kind: FileKind) -> Result<Vec<String>, S
     if clip.track_count() == 0 {
         return Err("Nothing to save: the clip has no tracks.".into());
     }
-    let (bytes, warnings) = file::save(clip, kind).map_err(|e| format!("Not saved: {e}."))?;
-    std::fs::write(path, bytes).map_err(|e| format!("Could not write {}: {e}", file_name(path)))?;
-    Ok(warnings)
+    file::save_to(clip, kind, path).map_err(|e| format!("Not saved: {e}."))
 }
 
 fn kept_tracks(clip: &Clip, skip_conductor: bool) -> usize {

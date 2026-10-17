@@ -7,12 +7,13 @@
 //! `2009` is its own end of track, whereas a clipboard copy has no conductor
 //! and every track's `2009` is the copied range's length.
 
+use std::io::Write;
 use std::path::Path;
 
 use thiserror::Error;
 
 use crate::format::chunk;
-use crate::format::clip::{check_format_limits, decode_clip, encode_clip_with, verify_encoding, Clip, EncodeOptions, TopNode, Track, TrackChild};
+use crate::format::clip::{check_format_limits, decode_clip, verify_encoding, Clip, EncodeOptions, StreamPlan, TopNode, Track, TrackChild};
 use crate::format::envelope::{self, EnvelopeError, Magic};
 use crate::format::midi;
 use crate::format::smf::SmfError;
@@ -116,15 +117,79 @@ pub fn save(clip: &Clip, kind: FileKind) -> Result<(Vec<u8>, Vec<String>), Strin
     }
 }
 
+/// Encode a clip straight into a file, streaming: memory use stays small
+/// whatever the clip size. The file is written under a temporary name and
+/// renamed when complete, so a failure never leaves half a file behind.
+pub fn save_to(clip: &Clip, kind: FileKind, path: &Path) -> Result<Vec<String>, String> {
+    let tmp = path.with_extension(format!("{}.part", kind.extension()));
+    let result = (|| {
+        let file = std::fs::File::create(&tmp).map_err(|e| format!("could not create the file: {e}"))?;
+        let mut w = std::io::BufWriter::with_capacity(4 << 20, file);
+        let warnings = match kind {
+            FileKind::Dms => {
+                write_dms(clip, &mut w)?;
+                Vec::new()
+            }
+            FileKind::Mid => midi::write_smf(clip, &mut w)?,
+        };
+        w.flush().map_err(|e| format!("could not write the file: {e}"))?;
+        Ok(warnings)
+    })();
+    match result {
+        Ok(warnings) => {
+            std::fs::rename(&tmp, path).map_err(|e| format!("could not finish the file: {e}"))?;
+            Ok(warnings)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Encoded streams up to this size are fully re-checked before writing
+/// (encode → count the notes in the bytes). Bigger ones are produced
+/// block by block and never exist whole, so they rely on the stream
+/// encoder, which is tested against the full encoder byte for byte.
+const VERIFY_BYTES: usize = 64 << 20;
+
+/// Encode, check and compress a clip into `sink`, a block at a time.
+fn write_envelope(
+    clip: &Clip,
+    opts: &EncodeOptions,
+    notes: usize,
+    sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<(), String> {
+    check_format_limits(clip, opts)?;
+    let plan = StreamPlan::new(clip, opts);
+    let io = |e: std::io::Error| format!("could not write: {e}");
+    if plan.len() <= VERIFY_BYTES {
+        let mut unpacked = vec![0u8; plan.len()];
+        plan.fill(0, &mut unpacked);
+        verify_encoding(notes, &unpacked)?;
+        return envelope::encode_streamed(unpacked.len(), Magic::PortalSequenceData, |at, buf| buf.copy_from_slice(&unpacked[at..at + buf.len()]), sink).map_err(io);
+    }
+    envelope::encode_streamed(plan.len(), Magic::PortalSequenceData, |at, buf| plan.fill(at, buf), sink).map_err(io)
+}
+
+fn dms_options(clip: &Clip) -> EncodeOptions {
+    EncodeOptions {
+        insert_before_first_track: (!clip.tracks().any(|t| t.is_conductor())).then(|| conductor_track(clip.span())),
+        ..Default::default()
+    }
+}
+
+/// Stream a clip as a `.dms` file into `w`.
+pub fn write_dms(clip: &Clip, w: &mut impl Write) -> Result<(), String> {
+    write_envelope(clip, &dms_options(clip), clip.note_count(), |b| w.write_all(b))
+}
+
 /// `.dms` bytes. A clip without a conductor track (a clipboard copy) gets an
 /// empty one in front so Domino opens every copied track as a normal track.
 pub fn to_dms(clip: &Clip) -> Result<Vec<u8>, String> {
-    let opts = EncodeOptions {
-        insert_before_first_track: (!clip.tracks().any(|t| t.is_conductor())).then(|| conductor_track(clip.span())),
-        ..Default::default()
-    };
-    check_format_limits(clip, &opts)?;
-    Ok(envelope::encode(&encode_clip_with(clip, &opts), Magic::PortalSequenceData))
+    let mut out = Vec::new();
+    write_dms(clip, &mut out)?;
+    Ok(out)
 }
 
 /// An empty conductor track, built from Domino's own track template.
@@ -166,10 +231,14 @@ pub fn clipboard_payload(clip: &Clip, skip_conductor: bool) -> Result<Vec<u8>, S
         uniform_length: (!uniform).then(|| clip.tracks().filter(kept).map(Track::span).max().unwrap_or(1)),
         ..Default::default()
     };
-    check_format_limits(clip, &opts)?;
-    let unpacked = encode_clip_with(clip, &opts);
-    verify_encoding(notes, &unpacked)?;
-    Ok(envelope::encode(&unpacked, Magic::PortalSequenceData))
+    // only the compressed payload is ever held (the clipboard needs it whole)
+    let mut out = Vec::new();
+    write_envelope(clip, &opts, notes, |b| {
+        out.extend_from_slice(b);
+        Ok(())
+    })?;
+    out.shrink_to_fit();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -222,6 +291,18 @@ mod tests {
         assert_eq!(loaded.kind, FileKind::Mid);
         let notes: Vec<_> = loaded.clip.note_views().iter().map(|n| (n.tick, n.gate, n.key, n.vel)).collect();
         assert_eq!(notes, vec![(0, 240, 36, 100), (240, 240, 38, 90), (480, 480, 127, 64)]);
+    }
+
+    #[test]
+    fn saving_to_a_file_streams_the_same_bytes() {
+        let dir = std::env::temp_dir().join(format!("dominokit-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for kind in [FileKind::Dms, FileKind::Mid] {
+            let path = dir.join(format!("x.{}", kind.extension()));
+            save_to(&golden(), kind, &path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), save(&golden(), kind).unwrap().0);
+            assert!(!path.with_extension(format!("{}.part", kind.extension())).exists());
+        }
     }
 
     #[test]

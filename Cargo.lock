@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "dominokit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "dominokit-core",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "dominokit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "hex-literal",

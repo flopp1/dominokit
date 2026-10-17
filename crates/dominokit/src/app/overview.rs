@@ -8,9 +8,9 @@
 //! the view or the clip changes. Overlap is removed while rasterising: for
 //! each track and key the stripe remembers how far right it has already
 //! painted, so a note hidden under an earlier one costs one comparison and
-//! no pixels. Each track's notes are indexed by length class (powers of 4),
-//! so finding what a time window shows is a binary search per class that
-//! looks back no further than that class's longest note.
+//! no pixels. Finding what a time window shows is a binary search on a
+//! sparse sample of each track's notes (a few bytes per thousand notes),
+//! plus a short list of the rare very long notes.
 
 use std::time::{Duration, Instant};
 
@@ -27,11 +27,23 @@ use super::theme::{track_color, ACCENT};
 pub const DEFAULT_VIEW: f64 = 7680.0;
 const MIN_VIEW: f64 = 16.0;
 
-/// One track's notes, grouped by length class: class `c` holds the notes
-/// with `gate < 4^(c+1)`, as child indices in tick order.
+/// What a track needs to find the notes of a time window quickly, kept
+/// small: a few bytes per thousand notes for tracks in time order.
+///
+/// Notes in tick order are found by binary search on `samples` (every
+/// `SAMPLE`-th note), then scanning forward; looking back `short` ticks is
+/// enough for all but the longest 0.1 % of notes, which are listed in
+/// `classes` instead. Tracks not in tick order list every note there.
 struct TrackIndex {
+    samples: Vec<(u32, usize)>,
+    short: u64,
+    in_order: bool,
+    /// By length class: class `c` holds notes with `gate < 4^(c+1)`, as
+    /// child indices in tick order.
     classes: Vec<(u64, Vec<usize>)>,
 }
+
+const SAMPLE: usize = 256;
 
 #[derive(Clone, Copy, PartialEq)]
 struct RasterKey {
@@ -278,30 +290,51 @@ fn legend(ui: &mut egui::Ui, color: Color32, text: &str) {
 
 fn build_index(clip: &Clip) -> Vec<TrackIndex> {
     let tracks: Vec<&Track> = clip.tracks().collect();
-    tracks
-        .par_iter()
-        .map(|t| {
-            let mut classes: Vec<Vec<usize>> = vec![Vec::new(); 17];
-            for (i, c) in t.children.iter().enumerate() {
-                if let Some(n) = c.as_note() {
-                    classes[(n.gate.max(1).ilog2() / 2) as usize].push(i);
-                }
+    tracks.par_iter().map(|t| index_track(t)).collect()
+}
+
+fn index_track(t: &Track) -> TrackIndex {
+    let mut last = 0u32;
+    let in_order = t.notes().all(|n| {
+        let ok = n.tick >= last;
+        last = n.tick;
+        ok
+    });
+    // "short" = up to the 99.9th percentile of (sampled) gates
+    let short = if in_order {
+        let mut gates: Vec<u32> = t.notes().step_by(64).map(|n| n.gate).collect();
+        gates.sort_unstable();
+        gates.get(gates.len().saturating_sub(1) * 999 / 1000).map_or(0, |&g| g as u64).max(16)
+    } else {
+        0
+    };
+    let mut samples = Vec::new();
+    let mut classes: Vec<Vec<usize>> = vec![Vec::new(); 17];
+    let mut seen = 0usize;
+    for (i, c) in t.children.iter().enumerate() {
+        let Some(n) = c.as_note() else { continue };
+        if in_order && seen % SAMPLE == 0 {
+            samples.push((n.tick, i));
+        }
+        seen += 1;
+        if n.gate as u64 > short {
+            classes[(n.gate.max(1).ilog2() / 2) as usize].push(i);
+        }
+    }
+    let tick = |i: &usize| t.children[*i].as_note().unwrap().tick;
+    let classes = classes
+        .into_iter()
+        .enumerate()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(c, mut v)| {
+            if !v.windows(2).all(|w| tick(&w[0]) <= tick(&w[1])) {
+                v.par_sort_by_key(tick);
             }
-            let tick = |i: &usize| t.children[*i].as_note().unwrap().tick;
-            let classes = classes
-                .into_iter()
-                .enumerate()
-                .filter(|(_, v)| !v.is_empty())
-                .map(|(c, mut v)| {
-                    if !v.windows(2).all(|w| tick(&w[0]) <= tick(&w[1])) {
-                        v.par_sort_by_key(tick);
-                    }
-                    (4u64.pow(c as u32 + 1), v)
-                })
-                .collect();
-            TrackIndex { classes }
+            v.shrink_to_fit();
+            (4u64.pow(c as u32 + 1), v)
         })
-        .collect()
+        .collect();
+    TrackIndex { samples, short, in_order, classes }
 }
 
 /// Draw the notes in `[start, start + len)` into a `size` image, keys
@@ -337,37 +370,57 @@ fn rasterize(clip: &Clip, index: &[TrackIndex], start: f64, len: f64, size: [usi
             let mut drawn = 0usize;
             for (ti, (track, idx)) in tracks.iter().zip(index).enumerate() {
                 let base = track_color(ti);
+                // paint one note unless what this key already shows hides it
+                // (`covered`: how far right each key is painted; valid while
+                // the notes come in tick order)
+                let mut paint = |n: &dominokit_core::format::clip::NoteItem, covered: &mut [usize; 256]| {
+                    let (tick, end) = (n.tick as f64, n.end_u32() as f64);
+                    if end <= t0 || n.key < keys.0 || n.key > keys.1 {
+                        return;
+                    }
+                    let a = (((tick - start) / tpp).floor() as i64 - x0 as i64).max(0) as usize;
+                    let b = (((end - start) / tpp).ceil() as i64 - x0 as i64).clamp(a as i64 + 1, sw as i64) as usize;
+                    let c = &mut covered[n.key as usize];
+                    if b <= *c {
+                        return;
+                    }
+                    let from = a.max(*c);
+                    *c = b;
+                    drawn += 1;
+                    let shade = 0.55 + 0.45 * (n.vel.min(127) as f32 / 127.0);
+                    let color = Color32::from_rgb((base.r() as f32 * shade) as u8, (base.g() as f32 * shade) as u8, (base.b() as f32 * shade) as u8);
+                    let (y0, y1) = row_of[n.key as usize];
+                    for y in y0..y1 {
+                        px[y * sw + from..y * sw + b].fill(color);
+                    }
+                };
+                if idx.in_order {
+                    // the short notes: from the sample just before the window
+                    let from_tick = (t0 - idx.short as f64).max(0.0);
+                    let s = idx.samples.partition_point(|&(tick, _)| (tick as f64) < from_tick);
+                    let first = if s == 0 { 0 } else { idx.samples[s - 1].1 };
+                    let mut covered = [0usize; 256];
+                    for c in &track.children[first..] {
+                        let Some(n) = c.as_note() else { continue };
+                        if n.tick as f64 >= t1 {
+                            break;
+                        }
+                        if n.gate as u64 <= idx.short {
+                            paint(n, &mut covered);
+                        }
+                    }
+                }
+                // the long notes (or every note of a track out of order)
                 for (longest, notes) in &idx.classes {
-                    // how far right each key is already painted (per class:
-                    // within one class the notes come in tick order)
                     let mut covered = [0usize; 256];
                     let from_tick = (t0 - *longest as f64).max(0.0);
                     let first = notes.partition_point(|&i| (track.children[i].as_note().unwrap().tick as f64) < from_tick);
                     for &ci in &notes[first..] {
                         let n = track.children[ci].as_note().unwrap();
-                        let tick = n.tick as f64;
-                        if tick >= t1 {
+                        if n.tick as f64 >= t1 {
                             break;
                         }
-                        let end = n.end_u32() as f64;
-                        if end <= t0 || n.key < keys.0 || n.key > keys.1 {
-                            continue;
-                        }
-                        let a = (((tick - start) / tpp).floor() as i64 - x0 as i64).max(0) as usize;
-                        let b = (((end - start) / tpp).ceil() as i64 - x0 as i64).clamp(a as i64 + 1, sw as i64) as usize;
-                        let c = &mut covered[n.key as usize];
-                        if b <= *c {
-                            continue; // hidden behind what this key already shows
-                        }
-                        let from = a.max(*c);
-                        *c = b;
-                        drawn += 1;
-                        let shade = 0.55 + 0.45 * (n.vel.min(127) as f32 / 127.0);
-                        let color = Color32::from_rgb((base.r() as f32 * shade) as u8, (base.g() as f32 * shade) as u8, (base.b() as f32 * shade) as u8);
-                        let (y0, y1) = row_of[n.key as usize];
-                        for y in y0..y1 {
-                            px[y * sw + from..y * sw + b].fill(color);
-                        }
+                        paint(n, &mut covered);
                     }
                 }
             }
